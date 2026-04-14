@@ -1,16 +1,17 @@
 import asyncio
+import collections.abc
 import concurrent.futures
 import contextlib
-import io
 import multiprocessing.connection
 import multiprocessing.synchronize
 import os
+import re
 import shlex
 import signal
 import sys
 import threading
 import types
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click.testing
@@ -260,8 +261,8 @@ class KopfCLI:
         self._reraise = reraise
         self._killed = False
         self._stop_flag = ctx.Event()
-        self._output_lock = threading.Lock()
-        self._output_buffer = io.BytesIO()
+        self._buffer = b''
+        self._buffer_cond = threading.Condition()
 
         # Pipe for output capture. duplex=False: parent reads, child writes.
         self._parent_conn, self._child_conn = ctx.Pipe(duplex=False)
@@ -342,13 +343,18 @@ class KopfCLI:
         cli.main(args=cli_args, obj=ctxobj, standalone_mode=True)
 
     def _read_output(self) -> None:
+        # No need to be thrifty: we keep the whole output in memory anyway, not streaming it.
+        # But beware of full-size duplicates in memory: one in `data`, another in the buffer.
+        chunk_size: int = 10240
         fd = self._parent_conn.fileno()
         while True:
-            data: bytes = os.read(fd, 4096)
+            data: bytes = os.read(fd, chunk_size)
             if not data:  # eof
                 break
-            with self._output_lock:
-                self._output_buffer.write(data)
+            with self._buffer_cond:
+                self._buffer += data
+                self._buffer_cond.notify_all()
+            del data  # reset before the blocking read in case it is huge
 
     def _is_normal_exit(self, exit_code: int | None) -> bool:
         if exit_code == 0:
@@ -364,6 +370,19 @@ class KopfCLI:
         """
         return self._process.exitcode
 
+    def buffer(self) -> bytes:
+        """
+        The currently accumulated output buffer of the operator subprocess.
+
+        Both streams (stdout + stderr) are mixed into one to avoid chronological
+        discrepancies, i.e. when lines are consumed not in the order the happen.
+
+        Unlike :prop:`~KopfCLI.output`, the buffer can contain partial lines
+        as it consumes them from the stream in fixed-size chunks.
+        """
+        with self._buffer_cond:
+            return self._buffer
+
     @property
     def output(self) -> str:
         """
@@ -371,9 +390,66 @@ class KopfCLI:
 
         Both streams (stdout + stderr) are mixed into one to avoid chronological
         discrepancies, i.e. when lines are consumed not in the order the happen.
+
+        Unlike :prop:`~KopfCLI.buffer`, there is a guarantee that the output
+        contains only the whole lines (ends with a newline or the process exit).
         """
-        with self._output_lock:
-            return self._output_buffer.getvalue().decode()
+        with self._buffer_cond:
+            return self._output
+
+    @property
+    def _output(self) -> str:
+        # If exited or not started, return all output regardless of newlines (even partial lines).
+        if not self._process.is_alive():
+            return self._buffer.decode()
+
+        # If still running, return only the whole lines, keep the partial lines for self.
+        parts = self._buffer.rsplit(b'\n', maxsplit=1)
+        if len(parts) == 2:
+            whole, tail = parts
+            whole += b'\n'
+            return whole.decode()
+
+        # If started but got no output yet (at least one line), return as if no whole lines yet.
+        return ''
+
+    def wait_for(self, v: Callable[[], bool] | str | bytes | Collection[str | bytes], /, *, timeout: float | None = None) -> None:
+        """
+        Wait until a pattern appears or a condition is met in the output.
+
+        If a callable (no arguments), then it must return true when satisfied.
+
+        If a ``str`` or ``bytes``, then this is a regular expression matching
+        the expected string (the wait compiles it internally for speed).
+        Note the subtle difference: strings match against a whole-line output,
+        while bytes match against the full buffer, including the partial lines.
+        It is a rough shortcut for ``lambda: re.search(pattern, runner.output)``
+        for ``str`` or the same with ``runner.buffer`` for ``bytes``.
+
+        If a collection (tuple, list, set), then **any** of the patterns
+        must match to wake up from the wait.
+        """
+        match v:
+            case str():
+                pattern_s: re.Pattern[str] = re.compile(v)
+                with self._buffer_cond:
+                    self._buffer_cond.wait_for(lambda: pattern_s.search(self._output), timeout=timeout)
+            case bytes():
+                pattern_b: re.Pattern[bytes] = re.compile(v)
+                with self._buffer_cond:
+                    self._buffer_cond.wait_for(lambda: pattern_b.search(self._buffer), timeout=timeout)
+            case collections.abc.Collection():
+                patterns_s: set[re.Pattern[str]] = {re.compile(p) for p in v if isinstance(p, str)}
+                patterns_b: set[re.Pattern[bytes]] = {re.compile(p) for p in v if isinstance(p, bytes)}
+                with self._buffer_cond:
+                    # TODO: optimize: calculate buffer & output only once, not for every pattern.
+                    #       -> move this check into a supplimentary staticmethod, use partials
+                    self._buffer_cond.wait_for(lambda: any(p.search(self._buffer) for p in patterns_b) or any(p.search(self._output) for p in patterns_s), timeout=timeout)
+            case _ if callable(v):
+                with self._buffer_cond:
+                    self._buffer_cond.wait_for(v, timeout=timeout)
+            case _:
+                raise ValueError(f"Unsupported pattern type: {v!r}")
 
 
 class KopfThread:
